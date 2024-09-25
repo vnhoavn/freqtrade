@@ -1283,8 +1283,8 @@ class FreqtradeBot(LoggingMixin):
                     logger.warning(
                         f"Unable to handle stoploss on exchange for {trade.pair}: {exception}"
                     )
-                # Check if we can sell our current pair
-                if not trade.has_open_orders and trade.is_open and self.handle_trade(trade):
+                # Check if we can exit our current position for this trade
+                if trade.has_open_position and trade.is_open and self.handle_trade(trade):
                     trades_closed += 1
 
             except DependencyException as exception:
@@ -1428,9 +1428,7 @@ class FreqtradeBot(LoggingMixin):
                 self.handle_protections(trade.pair, trade.trade_direction)
                 return True
 
-        if trade.has_open_orders or not trade.is_open:
-            # Trade has an open order, Stoploss-handling can't happen in this case
-            # as the Amount on the exchange is tied up in another trade.
+        if not trade.has_open_position or not trade.is_open:
             # The trade can be closed already (sell-order fill confirmation came in this iteration)
             return False
 
@@ -1696,6 +1694,30 @@ class FreqtradeBot(LoggingMixin):
                         logger.warning(f"Unable to replace order for {trade.pair}: {exception}")
                         self.replace_order_failed(trade, f"Could not replace order for {trade}.")
 
+    def cancel_open_orders_of_trade(self, trade: Trade, reason: str, sides: List[str]) -> None:
+        """
+        Cancel trade orders of specified sides that are currently open
+        :param trade: Trade object of the trade we're analyzing
+        :param reason: The reason for that cancellation
+        :param sides: The sides where cancellation should take place
+        :return: None
+        """
+
+        for open_order in trade.open_orders:
+            try:
+                order = self.exchange.fetch_order(open_order.order_id, trade.pair)
+            except ExchangeError:
+                logger.info("Can't query order for %s due to %s", trade, traceback.format_exc())
+                continue
+
+            for side in sides:
+                if order["side"] == side:
+                    if order["side"] == trade.entry_side:
+                        self.handle_cancel_enter(trade, order, open_order, reason)
+
+                    elif order["side"] == trade.exit_side:
+                        self.handle_cancel_exit(trade, order, open_order, reason)
+
     def cancel_all_open_orders(self) -> None:
         """
         Cancel all orders that are currently open
@@ -1703,22 +1725,10 @@ class FreqtradeBot(LoggingMixin):
         """
 
         for trade in Trade.get_open_trades():
-            for open_order in trade.open_orders:
-                try:
-                    order = self.exchange.fetch_order(open_order.order_id, trade.pair)
-                except ExchangeError:
-                    logger.info("Can't query order for %s due to %s", trade, traceback.format_exc())
-                    continue
+            self.cancel_open_orders_of_trade(
+                trade, constants.CANCEL_REASON["ALL_CANCELLED"], [trade.entry_side, trade.exit_side]
+            )
 
-                if order["side"] == trade.entry_side:
-                    self.handle_cancel_enter(
-                        trade, order, open_order, constants.CANCEL_REASON["ALL_CANCELLED"]
-                    )
-
-                elif order["side"] == trade.exit_side:
-                    self.handle_cancel_exit(
-                        trade, order, open_order, constants.CANCEL_REASON["ALL_CANCELLED"]
-                    )
         Trade.commit()
 
     def handle_cancel_enter(
@@ -1963,6 +1973,13 @@ class FreqtradeBot(LoggingMixin):
         )
 
         limit = self.get_valid_price(custom_exit_price, proposed_limit_rate)
+
+        if trade.has_open_orders:
+            # cancel any open order of this trade
+            self.cancel_open_orders_of_trade(
+                trade, constants.CANCEL_REASON["REPLACE"], [trade.exit_side]
+            )
+            Trade.commit()
 
         # First cancelling stoploss on exchange ...
         trade = self.cancel_stoploss_on_exchange(trade)
